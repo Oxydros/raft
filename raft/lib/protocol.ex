@@ -5,25 +5,53 @@ defmodule Raft.Protocol do
 
   require Logger
 
-  def id(), do: Node.self()
-  def cluster, do: [:toto@nameless, :titi@nameless, :tata@nameless] |> Enum.reject(fn n -> n == id() end)
+  def cluster, do: [:toto@nameless, :titi@nameless, :tata@nameless] |> Enum.reject(fn n -> n == Node.self() end)
 
-  ## CLIENT
+  ## CLIENT -- FSM
+
+  @doc """
+  Write a log on the distributed FSM, and apply it.
+  """
+  def write_log(new_log) when not is_list(new_log), do: write_log([new_log])
+  def write_log(new_log) do
+    leader = get_leader()
+    cond do
+      leader == Node.self ->
+        ret_ref = make_ref()
+        :ok = :gen_statem.cast(__MODULE__, {:write_log, new_log, self(), ret_ref})
+        receive do
+          {^ret_ref, reply} ->
+            {:ok, reply}
+        after
+          10_000 ->
+            {:error, :timeout}
+        end
+      true ->
+        {:error, {:redirect, leader}}
+    end
+  end
+
+  ## SERVER COMMUNICATION
 
   def start_fsm() do
     :ok = :gen_statem.cast(__MODULE__, :begin)
   end
 
-  def append_entries(asking_node, req) do
+  def append_entries_rpc(asking_node, req) do
     {:ok, {_term, _success}=res} = :gen_statem.call(__MODULE__, {:append_entries, req})
-    :gen_statem.cast({__MODULE__, asking_node}, {:resp_append, res})
+    :gen_statem.cast({__MODULE__, asking_node}, {:resp_append, res, Node.self})
     :ok
   end
 
-  def request_vote(asking_node, req) do
+  def request_vote_rpc(asking_node, req) do
     {:ok, {_term, _vote}=res} = :gen_statem.call(__MODULE__, {:request_vote, req})
-    :gen_statem.cast({__MODULE__, asking_node}, {:resp_vote, res})
+    :gen_statem.cast({__MODULE__, asking_node}, {:resp_vote, res, Node.self})
     :ok
+  end
+
+  def get_leader() do
+    {:ok, leader} = :gen_statem.call(__MODULE__, :get_leader)
+    leader
   end
 
   ## SERVER
@@ -53,17 +81,18 @@ defmodule Raft.Protocol do
 
       # Volatile -- all
       commitIndex: 0,
-      lastApplied: 0,
+      leader: nil,
 
       # Volatile -- candidates
       votes: 0,
 
       # Volatile -- leaders
       nextIndex: [],
-      matchIndex: []
+      matchIndex: [],
+      replyMap: %{}
     }
 
-    Logger.debug("Starting FSM for #{id()}")
+    Logger.debug("Starting FSM for #{Node.self()}")
 
     ## Init reading local storage
     ## TODO
@@ -112,6 +141,8 @@ defmodule Raft.Protocol do
 
     log_term_at_idx = fsm_data[:logs] |> Enum.at(l_prev_idx - 1)
     log_term_at_idx = log_term_at_idx[:term] || -1
+
+    # We dont agree upon the version of logs, or follower have a better term
     failure? = l_term < fsm_data[:currentTerm] || log_term_at_idx != l_prev_term
 
     fsm_data = if not failure? do
@@ -119,12 +150,14 @@ defmodule Raft.Protocol do
       # This will overwrite eventual conflicts
       new_logs = (fsm_data[:logs] |> Enum.take(l_prev_idx)) ++ entries
       new_commit_idx = min(l_commit_idx, new_logs |> Enum.count)
-      new_last_applied = apply_logs(new_logs, fsm_data[:lastApplied], new_commit_idx)
+
+      #Apply logs from fsm_data[:commitIndex] to new_commit_idx
+      fsm_data = apply_logs(fsm_data, fsm_data[:commitIndex], new_commit_idx, new_logs)
       fsm_data
         |> Map.put(:logs, new_logs)
         |> Map.put(:commitIndex, new_commit_idx)
-        |> Map.put(:lastApplied, new_last_applied)
         |> Map.put(:currentTerm, l_term)
+        |> Map.put(:leader, l_id)
     else
       fsm_data
     end
@@ -184,8 +217,12 @@ defmodule Raft.Protocol do
   end
 
   # Ignore resp vote
-  def follower(:cast, {:resp_vote, {_term, _vote?}}, _fsm_data) do
+  def follower(:cast, {:resp_vote, {_term, _vote?}, _from}, _fsm_data) do
     :keep_state_and_data
+  end
+
+  def follower(event_type, event_data, fsm_state) do
+    handle_common(:follower, event_type, event_data, fsm_state)
   end
 
   ## --- CANDIDATE LOGIC ---
@@ -198,8 +235,9 @@ defmodule Raft.Protocol do
 
     fsm_data = fsm_data
       |> Map.put(:currentTerm, new_term)
-      |> Map.put(:vote, id())
+      |> Map.put(:vote, Node.self())
       |> Map.put(:votes, 1)
+      |> Map.put(:leader, nil)
 
     last_log = fsm_data[:logs] |> Enum.at(-1)
     last_log_idx = fsm_data[:logs] |> Enum.count
@@ -207,14 +245,14 @@ defmodule Raft.Protocol do
 
     query = %{
       term: new_term,
-      candidateId: id(),
+      candidateId: Node.self(),
       lastLogIndex: last_log_idx,
       lastLogTerm: last_log_term
     }
 
     Logger.debug("[candidate] State for this election #{inspect(fsm_data, [pretty: true])}")
 
-    :rpc.eval_everywhere(cluster(), __MODULE__, :request_vote, [Node.self, query])
+    :rpc.eval_everywhere(cluster(), __MODULE__, :request_vote_rpc, [Node.self, query])
     {:keep_state, fsm_data, [get_election_timer()]}
   end
 
@@ -235,7 +273,9 @@ defmodule Raft.Protocol do
     } = req
     if l_term > fsm_data[:currentTerm] do
       # Accept entry, go back as follower
-      fsm_data = fsm_data |> change_term(l_term)
+      fsm_data = fsm_data
+        |> change_term(l_term)
+        |> Map.put(:leader, l_id)
       reply_data = {:ok, {fsm_data[:currentTerm], true}}
       {:next_state, :follower, fsm_data, [{:reply, from, reply_data}, :postpone]}
     else
@@ -279,8 +319,8 @@ defmodule Raft.Protocol do
     end
   end
 
-  def candidate(:cast, {:resp_vote, {term, vote?}}, %{currentTerm: current_term, votes: votes}=fsm_data) do
-    Logger.debug("[candidate] Received vote #{vote?} term #{term}")
+  def candidate(:cast, {:resp_vote, {term, vote?}, from}, %{currentTerm: current_term, votes: votes}=fsm_data) do
+    Logger.debug("[candidate] Received vote #{vote?} term #{term} from #{from}")
     new_votes = if vote?, do: votes + 1, else: votes
     fsm_data = fsm_data |> Map.put(:votes, new_votes)
 
@@ -303,11 +343,21 @@ defmodule Raft.Protocol do
     end
   end
 
+  # Ignore resp vote
+  def candidate(:cast, {:resp_append, {term, success?}, _from}, fsm_data) do
+    Logger.warn("[candidate] Got resp append with term #{term} - success #{success?}. Ignoring it !")
+    :keep_state_and_data
+  end
+
+  def candidate(event_type, event_data, fsm_state) do
+    handle_common(:candidate, event_type, event_data, fsm_state)
+  end
+
   ## LEADER LOGIC
 
   def leader(:enter, _oldState, fsm_data) do
     Logger.debug("[leader] Entering leader state #{inspect(fsm_data, pretty: true)}")
-    send_entries([], fsm_data)
+    send_entries(fsm_data)
 
     # Setup leader data
     next_log_index = (fsm_data[:logs] |> Enum.count) + 1
@@ -322,28 +372,74 @@ defmodule Raft.Protocol do
     fsm_data = fsm_data
       |> Map.put(:nextIndex, nextIndex)
       |> Map.put(:matchIndex, matchIndex)
+      |> Map.put(:replyMap, %{})
+      |> Map.put(:leader, Node.self())
     {:keep_state, fsm_data, [get_heartbeat_timer()]}
   end
 
   def leader({:timeout, :heartbeat}, :heartbeat, fsm_data) do
-    send_entries([], fsm_data)
+    send_entries(fsm_data)
     {:keep_state, fsm_data, [get_heartbeat_timer()]}
   end
 
-  # Ignore resp vote
-  def leader(:cast, {:resp_append, {term, success?}}, fsm_data) do
-    Logger.warn("[leader] Got resp append with term #{term} - success #{success?}")
-    :keep_state_and_data
+  def leader(:cast, {:resp_append, {term, success?}, from}, fsm_data) do
+    Logger.warn("[leader] Got resp append with term #{term} - success #{success?} from #{from}")
+
+    cond do
+      # We got a better term elsewhere, stepping down
+      term > fsm_data[:currentTerm] ->
+        fsm_data = change_term(fsm_data, term)
+        Logger.debug("[leader] Invalid local term ! go back to follower")
+        {:next_state, :follower, fsm_data}
+
+      # Write entry with success
+      success? ->
+        last_log_index = (fsm_data[:logs] |> Enum.count)
+        new_nextIndex = fsm_data[:nextIndex]
+          |> Map.put(from, last_log_index + 1)
+        new_matchIndex = fsm_data[:matchIndex]
+          |> Map.put(from, last_log_index)
+
+        fsm_data = fsm_data
+          |> Map.put(:nextIndex, new_nextIndex)
+          |> Map.put(:matchIndex, new_matchIndex)
+
+        fsm_data = update_commit_index(fsm_data)
+        {:keep_state, fsm_data}
+
+      # Failed to write entry, decrementing index to send
+      true ->
+        new_nextIndex = fsm_data[:nextIndex] |> Map.put(from, fsm_data[:nextIndex][from] - 1)
+        fsm_data = fsm_data |> Map.put(:nextIndex, new_nextIndex)
+        send_entries(fsm_data, from)
+        {:keep_state, fsm_data}
+    end
   end
 
   # Ignore resp vote
-  def leader(:cast, {:resp_vote, {_term, _vote?}}, _fsm_data) do
+  def leader(:cast, {:resp_vote, {_term, _vote?}, _from}, _fsm_data) do
     :keep_state_and_data
+  end
+
+  def leader(:cast, {:write_log, new_logs, from, ret_ref}, fsm_state) do
+    Logger.warn("[leader] Received write log with #{inspect(new_logs)}")
+    fsm_state = add_logs(new_logs, from, ret_ref, fsm_state)
+    {:keep_state, fsm_state}
   end
 
   def leader({:timeout, :election}, :election_timeout, fsm_data) do
     Logger.debug("[leader] Received election timeout, ignore it")
     :keep_state_and_data
+  end
+
+  def leader(event_type, event_data, fsm_state) do
+    handle_common(:leader, event_type, event_data, fsm_state)
+  end
+
+  ## -- COMMON EVENTS --
+
+  def handle_common(_state, {:call, from}, :get_leader, fsm_state) do
+    {:keep_state_and_data, [{:reply, from, {:ok, fsm_state[:leader]}}]}
   end
 
   ## -- CORE LOGIC --
@@ -358,33 +454,137 @@ defmodule Raft.Protocol do
     end
   end
 
-  defp apply_logs(logs, last_applied, commit_idx) do
-    if commit_idx > last_applied do
-      logs_size = logs |> Enum.count
-      new_last_applied = last_applied + 1
-      log_entry = logs |> Enum.fetch!(new_last_applied)
-      Logger.debug("Applying log entry #{new_last_applied} #{inspect(log_entry, [limit: :infinity, pretty: true])} to the FSM")
-      apply_logs(logs, new_last_applied, commit_idx)
+  defp add_logs(new_logs, node_from, ret_ref, fsm_state) do
+    # Format log entries to incorporate currentTerm
+    new_logs = new_logs |> Enum.map(fn log_data ->
+      %{data: log_data, term: fsm_state[:currentTerm]}
+    end)
+    new_logs = fsm_state[:logs] ++ new_logs
+    last_index = new_logs |> Enum.count
+
+    # Reply upon commit of this index by the cluster
+    # to the node asking to process this data (node_from)
+    Logger.debug("[ADD LOGS] Updating #{inspect fsm_state[:replyMap]} for #{last_index}")
+    new_replyMap = fsm_state[:replyMap] |> Map.update(last_index, [{node_from, ret_ref}], fn
+        current_list -> current_list ++ [{node_from, ret_ref}]
+      end)
+
+    # Add new log entries to local FSM state
+    fsm_state = fsm_state
+      |> Map.put(:logs, new_logs)
+      |> Map.put(:replyMap, new_replyMap)
+
+    # Propagate changes to the cluster
+    send_entries(fsm_state)
+    fsm_state
+  end
+
+  # Update the commit index given the matchIndex
+  defp update_commit_index(fsm_data) do
+    Logger.warn("[COMMIT] Trying to update COMMIT INDEX")
+    biggest_index = fsm_data[:matchIndex]
+      |> Map.values
+      |> Enum.group_by(& &1)
+      |> Map.values
+      |> Enum.map(fn l -> {Enum.count(l), Enum.at(l, 0)} end)
+      |> Enum.sort(fn {s, _a}, {s2, _b} -> s > s2 end)
+      |> Enum.at(0)
+      |> elem(1)
+
+    Logger.warn("[COMMIT] Biggest index is #{inspect biggest_index}")
+
+    logs = fsm_data[:logs]
+    log_at_biggest = if Enum.empty?(logs), do: nil, else: logs |> Enum.at(biggest_index - 1)
+    Logger.warn("[COMMIT] log_at_biggest is #{inspect log_at_biggest}")
+
+    term_at_biggest = log_at_biggest[:term] || -1
+
+    Logger.warn("[COMMIT] term_at_biggest is #{inspect term_at_biggest}")
+    if biggest_index > fsm_data[:commitIndex] && term_at_biggest == fsm_data[:currentTerm] do
+      Logger.warn("NEW COMMIT INDEX is #{inspect biggest_index}")
+      fsm_data = apply_logs(fsm_data, fsm_data[:commitIndex], biggest_index, logs)
+      fsm_data |> Map.put(:commitIndex, biggest_index)
     else
-      last_applied
+      fsm_data
     end
   end
 
-  defp send_entries(entries, fsm_data) do
-    last_log = fsm_data[:logs] |> Enum.at(-1)
-    last_log_idx = fsm_data[:logs] |> Enum.count
-    last_log_term = last_log[:term] || -1
+  # Commit the local logs given the new commit index on the leader
+  # Commit the logs by calling the local FSM
+  defp apply_logs(fsm_data, from_commit, to_commit, logs) do
+    if from_commit == to_commit do
+      fsm_data
+    else
+      log_entry = logs |> Enum.fetch!(from_commit)
 
-    query = %{
-      term: fsm_data[:currentTerm],
-      leaderID: id(),
-      prevLogIndex: last_log_idx,
-      prevLogTerm: last_log_term,
-      entries: entries,
-      leaderCommit: fsm_data[:commitIndex]
-    }
-    Logger.debug("Sending send_entries #{inspect(query, pretty: true)}")
-    :rpc.eval_everywhere(cluster(), __MODULE__, :append_entries, [Node.self, query])
+      Logger.debug("Applying log entry #{from_commit} #{inspect(log_entry, [limit: :infinity, pretty: true])} to the FSM")
+      #APPLY HERE
+      last_res = "APPLIED YES"
+
+      # Contact the waiting client(s)
+      to_notify = fsm_data[:replyMap][from_commit + 1] || []
+      Logger.debug("NOTIFYING #{inspect from_commit}: #{inspect to_notify}")
+      to_notify |> Enum.each(fn {node_from, ret_ref} ->
+        send(node_from, {ret_ref, last_res})
+      end)
+
+      fsm_data = fsm_data |> put_in([:replyMap, from_commit + 1], [])
+
+      apply_logs(fsm_data, from_commit + 1, to_commit, logs)
+    end
+  end
+
+  # Propagate new FSM state logs to the cluster
+  defp send_entries(fsm_data, target_node \\ :all)
+  defp send_entries(fsm_data, :all) do
+    cluster() |> Enum.each(fn node_id ->
+      send_entries(fsm_data, node_id)
+    end)
+  end
+
+  defp send_entries(fsm_data, target_node) do
+    node_nextIndex = fsm_data[:nextIndex][target_node]
+
+    logs = fsm_data[:logs]
+    last_log_idx = logs |> Enum.count
+
+    Logger.debug("SEND_ENTRIES FOR #{target_node}: last_log #{last_log_idx}  node last log #{node_nextIndex}")
+
+    if last_log_idx >= node_nextIndex do
+
+      to_take = (last_log_idx - node_nextIndex) + 1
+      entries = logs |> Enum.take(-to_take)
+
+      prev_log_index = node_nextIndex - 1
+      prev_log = if prev_log_index - 1 >= 0, do: logs |> Enum.at(prev_log_index - 1), else: nil
+      prev_log_term = prev_log[:term] || -1
+
+      Logger.debug("NEW LOG TO SEND TO #{target_node}: #{inspect to_take} : #{inspect entries}  #{inspect prev_log_index} #{inspect prev_log} #{inspect prev_log_term}")
+
+      query = %{
+        term: fsm_data[:currentTerm],
+        leaderID: Node.self(),
+        prevLogIndex: prev_log_index,
+        prevLogTerm: prev_log_term,
+        entries: entries,
+        leaderCommit: fsm_data[:commitIndex]
+      }
+      Logger.debug("Sending send_entries to #{target_node} #{inspect(query, pretty: true)}")
+      :rpc.cast(target_node, __MODULE__, :append_entries_rpc, [Node.self, query])
+    else
+      prev_log = if Enum.empty?(logs), do: nil, else: logs |> Enum.at(-1)
+      prev_log_term = prev_log[:term] || -1
+      query = %{
+        term: fsm_data[:currentTerm],
+        leaderID: Node.self(),
+        prevLogIndex: last_log_idx,
+        prevLogTerm: prev_log_term,
+        entries: [],
+        leaderCommit: fsm_data[:commitIndex]
+      }
+      Logger.debug("Sending send_entries to #{target_node} #{inspect(query, pretty: true)}")
+      :rpc.cast(target_node, __MODULE__, :append_entries_rpc, [Node.self, query])
+    end
   end
 
   defp change_term(fsm_data, new_term) do
