@@ -4,38 +4,27 @@ defmodule Raft.Protocol do
   """
 
   require Logger
-
-  def cluster, do: [:toto@nameless, :titi@nameless, :tata@nameless] |> Enum.reject(fn n -> n == Node.self() end)
-
   ## CLIENT -- FSM
 
   @doc """
   Write a log on the distributed FSM, and apply it.
   """
-  def write_log(new_log) when not is_list(new_log), do: write_log([new_log])
-  def write_log(new_log) do
-    leader = get_leader()
-    cond do
-      leader == Node.self ->
-        ret_ref = make_ref()
-        :ok = :gen_statem.cast(__MODULE__, {:write_log, new_log, self(), ret_ref})
-        receive do
-          {^ret_ref, reply} ->
-            {:ok, reply}
-        after
-          10_000 ->
-            {:error, :timeout}
-        end
-      true ->
-        {:error, {:redirect, leader}}
+  def write_log(new_log, timeout \\ 10_000)
+  def write_log(new_log, timeout) when not is_list(new_log), do: write_log([new_log], timeout)
+  def write_log(new_log, timeout) do
+    leader_node = get_leader!()
+    ret_ref = make_ref()
+    :ok = :gen_statem.cast({__MODULE__, leader_node}, {:write_log, new_log, self(), ret_ref})
+    receive do
+      {^ret_ref, reply} ->
+        reply
+    after
+      timeout ->
+        {:error, :timeout}
     end
   end
 
   ## SERVER COMMUNICATION
-
-  def start_fsm() do
-    :ok = :gen_statem.cast(__MODULE__, :begin)
-  end
 
   def append_entries_rpc(asking_node, req) do
     {:ok, {_term, _success}=res} = :gen_statem.call(__MODULE__, {:append_entries, req})
@@ -49,31 +38,31 @@ defmodule Raft.Protocol do
     :ok
   end
 
-  def get_leader() do
+  def get_leader!() do
     {:ok, leader} = :gen_statem.call(__MODULE__, :get_leader)
     leader
   end
 
-  ## SERVER
+  ## SERVER IMPLEMENTATION
 
-  def child_spec(_) do
+  def child_spec(args) do
     %{
       id: __MODULE__,
-      start: {__MODULE__, :start_link, []},
+      start: {__MODULE__, :start_link, [args]},
       restart: :transient,
       type: :worker
     }
   end
 
-  def start_link(), do: :gen_statem.start_link({:local, __MODULE__}, __MODULE__, nil, [])
+  def start_link(args), do: :gen_statem.start_link({:local, __MODULE__}, __MODULE__, args, [])
   def stop(), do: :gen_statem.stop(__MODULE__)
 
   def callback_mode() do
     [:state_functions, :state_enter]
   end
 
-  def init(_) do
-    initial_state = %{
+  def init(%{cluster: _cluster, module: _module} = args) do
+    initial_state = Map.merge(args, %{
       # Persistent on storage
       currentTerm: 0,
       votedFor: nil,
@@ -89,8 +78,8 @@ defmodule Raft.Protocol do
       # Volatile -- leaders
       nextIndex: [],
       matchIndex: [],
-      replyMap: %{}
-    }
+      replyMap: %{},
+    })
 
     Logger.debug("Starting FSM for #{Node.self()}")
 
@@ -252,7 +241,7 @@ defmodule Raft.Protocol do
 
     Logger.debug("[candidate] State for this election #{inspect(fsm_data, [pretty: true])}")
 
-    :rpc.eval_everywhere(cluster(), __MODULE__, :request_vote_rpc, [Node.self, query])
+    :rpc.eval_everywhere(fsm_data.cluster, __MODULE__, :request_vote_rpc, [Node.self, query])
     {:keep_state, fsm_data, [get_election_timer()]}
   end
 
@@ -333,7 +322,7 @@ defmodule Raft.Protocol do
         {:next_state, :follower, fsm_data, [get_election_timer()]}
 
       # Got the majority
-      has_quorum?(new_votes, cluster()) ->
+      has_quorum?(new_votes, fsm_data.cluster) ->
         Logger.debug("[candidate] Got quorum !")
         {:next_state, :leader, fsm_data}
 
@@ -361,11 +350,11 @@ defmodule Raft.Protocol do
 
     # Setup leader data
     next_log_index = (fsm_data[:logs] |> Enum.count) + 1
-    nextIndex = cluster() |> Enum.map(fn node_id ->
+    nextIndex = fsm_data.cluster |> Enum.map(fn node_id ->
       {node_id, next_log_index}
     end) |> Enum.into(%{})
 
-    matchIndex = cluster() |> Enum.map(fn node_id ->
+    matchIndex = fsm_data.cluster |> Enum.map(fn node_id ->
       {node_id, 0}
     end) |> Enum.into(%{})
 
@@ -517,9 +506,10 @@ defmodule Raft.Protocol do
     else
       log_entry = logs |> Enum.fetch!(from_commit)
 
-      Logger.debug("Applying log entry #{from_commit} #{inspect(log_entry, [limit: :infinity, pretty: true])} to the FSM")
+      Logger.debug("Applying log entry #{from_commit} #{inspect(log_entry, [limit: :infinity, pretty: true])} to the FSM #{inspect fsm_data.module}")
       #APPLY HERE
-      last_res = "APPLIED YES"
+      last_res = apply(fsm_data.module, :apply_log_entry, [log_entry.data, fsm_data])
+      Logger.debug("#{from_commit} APPLIED")
 
       # Contact the waiting client(s)
       to_notify = fsm_data[:replyMap][from_commit + 1] || []
@@ -528,7 +518,10 @@ defmodule Raft.Protocol do
         send(node_from, {ret_ref, last_res})
       end)
 
-      fsm_data = fsm_data |> put_in([:replyMap, from_commit + 1], [])
+      # Remove from reply map after notify
+      new_reply_map = fsm_data[:replyMap] || %{}
+      new_reply_map = Map.delete(new_reply_map, from_commit + 1)
+      fsm_data = fsm_data |> Map.put(:replyMap, new_reply_map)
 
       apply_logs(fsm_data, from_commit + 1, to_commit, logs)
     end
@@ -537,7 +530,7 @@ defmodule Raft.Protocol do
   # Propagate new FSM state logs to the cluster
   defp send_entries(fsm_data, target_node \\ :all)
   defp send_entries(fsm_data, :all) do
-    cluster() |> Enum.each(fn node_id ->
+    fsm_data.cluster |> Enum.each(fn node_id ->
       send_entries(fsm_data, node_id)
     end)
   end

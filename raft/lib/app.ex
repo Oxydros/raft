@@ -11,6 +11,6 @@ defmodule Raft.Application do
     #   Raft.Protocol
     # ]
     # Supervisor.start_link(children, [strategy: :one_for_one])
-    Raft.Protocol.start_link
+    # Raft.Protocol.start_link
   end
 end

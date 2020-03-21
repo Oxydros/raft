@@ -5,7 +5,7 @@ defmodule Raft.MixProject do
     [
       app: :raft,
       version: "0.1.0",
-      elixir: "~> 1.9.1",
+      elixir: "~> 1.10.2",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -14,7 +14,7 @@ defmodule Raft.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      mod: {Raft.Application, []},
+      # mod: {Raft.Application, []},
       extra_applications: [:logger]
     ]
   end
