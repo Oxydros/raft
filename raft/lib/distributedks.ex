@@ -12,6 +12,7 @@ defmodule DistributedKS do
 
   def get(key), do: DistributedGenserver.call_read(__MODULE__, {:get, key})
   def put(key, value), do: DistributedGenserver.call_write(__MODULE__, {:put, key, value})
+  def put_and_get(key, value), do: DistributedGenserver.call_write(__MODULE__, {:put_and_get, key, value})
   def state(), do: DistributedGenserver.call_read(__MODULE__, :get_full_state)
 
 
@@ -45,6 +46,10 @@ defmodule DistributedKS do
   end
 
   def handle_write({:put, key, value}, state) do
-    Map.put(state, key, value)
+    {:noreply, Map.put(state, key, value)}
+  end
+
+  def handle_write({:put_and_get, key, value}, state) do
+    {:reply, value, Map.put(state, key, value)}
   end
 end

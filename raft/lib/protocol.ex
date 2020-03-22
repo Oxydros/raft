@@ -4,7 +4,13 @@ defmodule Raft.Protocol do
   """
 
   require Logger
-  ## CLIENT -- FSM
+
+  @db_dir "#{Application.app_dir(:raft)}/.raft"
+  @state_key "RAFT_STATE"
+
+  #########################################
+  #               FSM Client              #
+  #########################################
 
   @doc """
   Write a log on the distributed FSM, and apply it.
@@ -24,7 +30,9 @@ defmodule Raft.Protocol do
     end
   end
 
-  ## SERVER COMMUNICATION
+  #########################################
+  #            FSM Server Utils           #
+  #########################################
 
   def append_entries_rpc(asking_node, req) do
     {:ok, {_term, _success}=res} = :gen_statem.call(__MODULE__, {:append_entries, req})
@@ -43,7 +51,9 @@ defmodule Raft.Protocol do
     leader
   end
 
-  ## SERVER IMPLEMENTATION
+  #########################################
+  #        Protocol implementation        #
+  #########################################
 
   def child_spec(args) do
     %{
@@ -54,20 +64,35 @@ defmodule Raft.Protocol do
     }
   end
 
-  def start_link(args), do: :gen_statem.start_link({:local, __MODULE__}, __MODULE__, args, [])
+  def start_link(%{cluster: _c, module: _m, id: _i} = args) do
+    :gen_statem.start_link({:local, __MODULE__}, __MODULE__, args, [])
+  end
   def stop(), do: :gen_statem.stop(__MODULE__)
 
   def callback_mode() do
     [:state_functions, :state_enter]
   end
 
-  def init(%{cluster: _cluster, module: _module} = args) do
-    initial_state = Map.merge(args, %{
-      # Persistent on storage
-      currentTerm: 0,
-      votedFor: nil,
-      logs: [],
+  def init(%{cluster: _cluster, module: module, id: raft_id} = args) do
+    Logger.debug("[Raft - Protocol] Starting FSM for #{inspect module}-#{inspect raft_id} --- #{Node.self()}")
 
+    File.mkdir_p(@db_dir)
+    path = '#{@db_dir}/#{raft_id}.db'
+    {:ok, storage_pid} = RocksDB.start_link(path)
+
+    persistent_storage = case RocksDB.get(storage_pid, @state_key) do
+      :not_found -> %{
+        currentTerm: 0,
+        votedFor: nil,
+        logs: [],
+      }
+      {:ok, v} -> v
+      err -> Logger.error("[Raft - Protocol] Error while reading local state #{inspect err}")
+    end
+
+    Logger.debug("[Raft - Protocol] Read #{inspect persistent_storage} from local storage")
+
+    initial_state = Map.merge(args, %{
       # Volatile -- all
       commitIndex: 0,
       leader: nil,
@@ -79,13 +104,12 @@ defmodule Raft.Protocol do
       nextIndex: [],
       matchIndex: [],
       replyMap: %{},
+
+      # Elixir
+      storage: storage_pid
     })
 
-    Logger.debug("Starting FSM for #{Node.self()}")
-
-    ## Init reading local storage
-    ## TODO
-
+    initial_state = Map.merge(initial_state, persistent_storage)
     {:ok, :follower, initial_state, []}
   end
 
@@ -104,7 +128,9 @@ defmodule Raft.Protocol do
     {:next_state, :follower, fsm_data}
   end
 
-  ## FOLLOWER LOGIC
+  #########################################
+  #            Follower logic             #
+  #########################################
 
   def follower(:enter, _oldState, fsm_data) do
     Logger.debug("[follower] Entering follower state #{inspect(fsm_data, pretty: true)}")
@@ -127,6 +153,8 @@ defmodule Raft.Protocol do
       entries: entries,
       leaderCommit: l_commit_idx
     } = req
+
+    %{currentTerm: savedTerm, logs: savedLogs} = fsm_data
 
     log_term_at_idx = fsm_data[:logs] |> Enum.at(l_prev_idx - 1)
     log_term_at_idx = log_term_at_idx[:term] || -1
@@ -154,7 +182,18 @@ defmodule Raft.Protocol do
     # Setup current term
     fsm_data = if l_term < fsm_data[:currentTerm], do: change_term(fsm_data, l_term), else: fsm_data
 
-    # :ok = Raft.LocalStorage.save_data("protocol_state", fsm_data)
+    # Only save if change in term or got new entries
+    cond do
+      fsm_data.currentTerm != savedTerm ->
+        :ok = save_to_persistent_storage(fsm_data)
+      (entries |> Enum.count) > 0 ->
+        :ok = save_to_persistent_storage(fsm_data)
+      (savedLogs |> Enum.count) != (fsm_data.logs |> Enum.count) ->
+        :ok = save_to_persistent_storage(fsm_data)
+      true ->
+        :ok
+    end
+
     reply_data = {:ok, {fsm_data[:currentTerm], not failure?}}
     Logger.warn("[follower] Replying #{inspect(reply_data, pretty: true)}")
     {:keep_state, fsm_data, [{:reply, from, reply_data}, get_election_timer()]}
@@ -195,12 +234,13 @@ defmodule Raft.Protocol do
     fsm_data = if give_vote? do
       Logger.debug("[follower] Giving vote to #{inspect(candidate_id)} for term #{req_term}")
       fsm_data
-        |> Map.put(:vote, candidate_id)
+        |> Map.put(:votedFor, candidate_id)
     else
       fsm_data
     end
 
-    # :ok = Raft.LocalStorage.save_data("protocol_state", fsm_data)
+    :ok = save_to_persistent_storage(fsm_data)
+
     reply_data = {:ok, {current_term, give_vote?}}
     {:keep_state, fsm_data, [{:reply, from, reply_data}, get_election_timer()]}
   end
@@ -214,7 +254,9 @@ defmodule Raft.Protocol do
     handle_common(:follower, event_type, event_data, fsm_state)
   end
 
-  ## --- CANDIDATE LOGIC ---
+  #########################################
+  #            Candidate logic            #
+  #########################################
 
   def candidate(:enter, _oldState, fsm_data) do
     Logger.debug("[candidate] Entering candidate state #{inspect(fsm_data, pretty: true)}")
@@ -224,7 +266,7 @@ defmodule Raft.Protocol do
 
     fsm_data = fsm_data
       |> Map.put(:currentTerm, new_term)
-      |> Map.put(:vote, Node.self())
+      |> Map.put(:votedFor, Node.self())
       |> Map.put(:votes, 1)
       |> Map.put(:leader, nil)
 
@@ -240,6 +282,8 @@ defmodule Raft.Protocol do
     }
 
     Logger.debug("[candidate] State for this election #{inspect(fsm_data, [pretty: true])}")
+
+    :ok = save_to_persistent_storage(fsm_data)
 
     :rpc.eval_everywhere(fsm_data.cluster, __MODULE__, :request_vote_rpc, [Node.self, query])
     {:keep_state, fsm_data, [get_election_timer()]}
@@ -266,6 +310,8 @@ defmodule Raft.Protocol do
         |> change_term(l_term)
         |> Map.put(:leader, l_id)
       reply_data = {:ok, {fsm_data[:currentTerm], true}}
+
+      :ok = save_to_persistent_storage(fsm_data)
       {:next_state, :follower, fsm_data, [{:reply, from, reply_data}, :postpone]}
     else
       # I'm better than the leader, refuse the append entry
@@ -301,9 +347,11 @@ defmodule Raft.Protocol do
 
     reply_data = {:ok, {fsm_data[:currentTerm], give_vote?}}
     if give_vote? do
-      fsm_data = fsm_data |> Map.put(:vote, candidate_id)
+      fsm_data = fsm_data |> Map.put(:votedFor, candidate_id)
+      :ok = save_to_persistent_storage(fsm_data)
       {:next_state, :follower, fsm_data, [{:reply, from, reply_data}]}
     else
+      :ok = save_to_persistent_storage(fsm_data)
       {:keep_state, fsm_data, [{:reply, from, reply_data}, get_election_timer()]}
     end
   end
@@ -319,6 +367,7 @@ defmodule Raft.Protocol do
       term > current_term ->
         fsm_data = change_term(fsm_data, term)
         Logger.debug("[candidate] Invalid local term ! go back to follower")
+        :ok = save_to_persistent_storage(fsm_data)
         {:next_state, :follower, fsm_data, [get_election_timer()]}
 
       # Got the majority
@@ -342,7 +391,9 @@ defmodule Raft.Protocol do
     handle_common(:candidate, event_type, event_data, fsm_state)
   end
 
-  ## LEADER LOGIC
+  #########################################
+  #              Leader logic             #
+  #########################################
 
   def leader(:enter, _oldState, fsm_data) do
     Logger.debug("[leader] Entering leader state #{inspect(fsm_data, pretty: true)}")
@@ -378,6 +429,7 @@ defmodule Raft.Protocol do
       # We got a better term elsewhere, stepping down
       term > fsm_data[:currentTerm] ->
         fsm_data = change_term(fsm_data, term)
+        :ok = save_to_persistent_storage(fsm_data)
         Logger.debug("[leader] Invalid local term ! go back to follower")
         {:next_state, :follower, fsm_data}
 
@@ -410,10 +462,10 @@ defmodule Raft.Protocol do
     :keep_state_and_data
   end
 
-  def leader(:cast, {:write_log, new_logs, from, ret_ref}, fsm_state) do
+  def leader(:cast, {:write_log, new_logs, from, ret_ref}, fsm_data) do
     Logger.warn("[leader] Received write log with #{inspect(new_logs)}")
-    fsm_state = add_logs(new_logs, from, ret_ref, fsm_state)
-    {:keep_state, fsm_state}
+    fsm_data = add_logs(new_logs, from, ret_ref, fsm_data)
+    {:keep_state, fsm_data}
   end
 
   def leader({:timeout, :election}, :election_timeout, fsm_data) do
@@ -425,13 +477,17 @@ defmodule Raft.Protocol do
     handle_common(:leader, event_type, event_data, fsm_state)
   end
 
-  ## -- COMMON EVENTS --
+  #########################################
+  #             Common events             #
+  #########################################
 
   def handle_common(_state, {:call, from}, :get_leader, fsm_state) do
     {:keep_state_and_data, [{:reply, from, {:ok, fsm_state[:leader]}}]}
   end
 
-  ## -- CORE LOGIC --
+  #########################################
+  #               Core logic              #
+  #########################################
 
   defp log_up_to_date?(last_c_log_idx, last_c_log_term, last_r_log_idx, last_r_log_term) do
     cond do
@@ -443,29 +499,31 @@ defmodule Raft.Protocol do
     end
   end
 
-  defp add_logs(new_logs, node_from, ret_ref, fsm_state) do
+  defp add_logs(new_logs, node_from, ret_ref, fsm_data) do
     # Format log entries to incorporate currentTerm
     new_logs = new_logs |> Enum.map(fn log_data ->
-      %{data: log_data, term: fsm_state[:currentTerm]}
+      %{data: log_data, term: fsm_data[:currentTerm]}
     end)
-    new_logs = fsm_state[:logs] ++ new_logs
+    new_logs = fsm_data[:logs] ++ new_logs
     last_index = new_logs |> Enum.count
 
     # Reply upon commit of this index by the cluster
     # to the node asking to process this data (node_from)
-    Logger.debug("[ADD LOGS] Updating #{inspect fsm_state[:replyMap]} for #{last_index}")
-    new_replyMap = fsm_state[:replyMap] |> Map.update(last_index, [{node_from, ret_ref}], fn
+    Logger.debug("[ADD LOGS] Updating #{inspect fsm_data[:replyMap]} for #{last_index}")
+    new_replyMap = fsm_data[:replyMap] |> Map.update(last_index, [{node_from, ret_ref}], fn
         current_list -> current_list ++ [{node_from, ret_ref}]
       end)
 
     # Add new log entries to local FSM state
-    fsm_state = fsm_state
+    fsm_data = fsm_data
       |> Map.put(:logs, new_logs)
       |> Map.put(:replyMap, new_replyMap)
 
+    :ok = save_to_persistent_storage(fsm_data)
+
     # Propagate changes to the cluster
-    send_entries(fsm_state)
-    fsm_state
+    send_entries(fsm_data)
+    fsm_data
   end
 
   # Update the commit index given the matchIndex
@@ -489,12 +547,20 @@ defmodule Raft.Protocol do
     term_at_biggest = log_at_biggest[:term] || -1
 
     Logger.warn("[COMMIT] term_at_biggest is #{inspect term_at_biggest}")
-    if biggest_index > fsm_data[:commitIndex] && term_at_biggest == fsm_data[:currentTerm] do
-      Logger.warn("NEW COMMIT INDEX is #{inspect biggest_index}")
-      fsm_data = apply_logs(fsm_data, fsm_data[:commitIndex], biggest_index, logs)
-      fsm_data |> Map.put(:commitIndex, biggest_index)
-    else
-      fsm_data
+    cond do
+      # New setup
+      fsm_data[:commitIndex] == 0 && biggest_index >= fsm_data[:commitIndex] ->
+        Logger.warn("NEW COMMIT INDEX is #{inspect biggest_index}")
+        fsm_data = apply_logs(fsm_data, fsm_data[:commitIndex], biggest_index, logs)
+        fsm_data |> Map.put(:commitIndex, biggest_index)
+
+      # Running fsm
+      biggest_index >= fsm_data[:commitIndex] && term_at_biggest == fsm_data[:currentTerm] ->
+        Logger.warn("NEW COMMIT INDEX is #{inspect biggest_index}")
+        fsm_data = apply_logs(fsm_data, fsm_data[:commitIndex], biggest_index, logs)
+        fsm_data |> Map.put(:commitIndex, biggest_index)
+      true ->
+        fsm_data
     end
   end
 
@@ -514,9 +580,12 @@ defmodule Raft.Protocol do
       # Contact the waiting client(s)
       to_notify = fsm_data[:replyMap][from_commit + 1] || []
       Logger.debug("NOTIFYING #{inspect from_commit}: #{inspect to_notify}")
-      to_notify |> Enum.each(fn {node_from, ret_ref} ->
-        send(node_from, {ret_ref, last_res})
-      end)
+
+      spawn fn ->
+        to_notify |> Enum.each(fn {node_from, ret_ref} ->
+          send(node_from, {ret_ref, last_res})
+        end)
+      end
 
       # Remove from reply map after notify
       new_reply_map = fsm_data[:replyMap] || %{}
@@ -583,7 +652,7 @@ defmodule Raft.Protocol do
   defp change_term(fsm_data, new_term) do
     fsm_data
       |> Map.put(:currentTerm, new_term)
-      |> Map.put(:vote, nil)
+      |> Map.put(:votedFor, nil)
       |> Map.put(:votes, 0)
   end
 
@@ -598,5 +667,13 @@ defmodule Raft.Protocol do
   defp has_quorum?(vote_number, cluster) do
     Logger.debug("[candidate] Checking quorum: got #{vote_number}, need #{((cluster |> Enum.count) / 2 + 1 )}")
     vote_number >= ((cluster |> Enum.count) / 2 + 1 )
+  end
+
+  defp save_to_persistent_storage(fsm_data) do
+    RocksDB.put(fsm_data.storage, @state_key, %{
+      currentTerm: fsm_data.currentTerm,
+      votedFor: fsm_data.votedFor,
+      logs: fsm_data.logs,
+    }, [sync: true])
   end
 end

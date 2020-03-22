@@ -12,10 +12,10 @@ defmodule DistributedGenserver do
       use GenServer
       require Logger
 
-      def init(%{cluster: cluster, init_args: init_args}) do
+      def init(%{cluster: cluster, timeout: timeout, init_args: init_args}) do
         Logger.info("[DistributedGenserver] #{__MODULE__} -- #{inspect init_args} on cluster -- #{inspect cluster}")
         {:ok, state} = initialize(init_args)
-        {:ok, %{state: state}, {:continue, {:setup_raft, cluster}}}
+        {:ok, %{state: state, timeout: timeout}, {:continue, {:setup_raft, cluster}}}
       end
 
       def handle_cast_read(_req, _state) do
@@ -32,7 +32,7 @@ defmodule DistributedGenserver do
       end
 
       def handle_continue({:setup_raft, cluster}, state) do
-        {:ok, raft_pid} = Raft.Protocol.start_link(%{cluster: cluster, module: __MODULE__, pid: self()})
+        {:ok, raft_pid} = Raft.Protocol.start_link(%{cluster: cluster, module: __MODULE__, pid: self(), id: "distributedKS"})
         {:noreply, state |> Map.put(:raft_pid, raft_pid)}
       end
 
@@ -47,24 +47,25 @@ defmodule DistributedGenserver do
 
       def handle_call({:write, request}, from, state) do
         log = request |> :erlang.term_to_binary
-        :ok = Raft.Protocol.write_log(log)
-        {:reply, :ok, state}
-        # case Raft.Protocol.write_log(log) do
-        #   {:noreply, new_state} ->
-        #     {:reply, :ok, %{state | state: new_state}}
-        #   {:reply, reply, new_state} ->
-        #     {:reply, {:ok, reply}, %{state | state: new_state}}
-        # end
+        spawn fn ->
+          reply = Raft.Protocol.write_log(log, state.timeout)
+          GenServer.reply(from, reply)
+        end
+        {:noreply, state}
+      end
+
+      def handle_call({:apply, request}, _from, state) do
+        case handle_write(request, state.state) do
+          {:noreply, new_state} ->
+            {:reply, :ok, %{state | state: new_state}}
+          {:reply, reply, new_state} ->
+            {:reply, reply, %{state | state: new_state}}
+        end
       end
 
       def handle_cast({:read, request}, state) do
         _ = handle_cast_read(request, state.state)
         {:noreply, state}
-      end
-
-      def handle_cast({:apply, request}, state) do
-        new_state = handle_write(request, state.state)
-        {:noreply, %{state | state: new_state}}
       end
 
       def handle_info(_, state) do
@@ -82,7 +83,7 @@ defmodule DistributedGenserver do
       # Called by the Raft Protocol when the log entry is commited
       def apply_log_entry(log_entry, fsm_data) do
         request = :erlang.binary_to_term(log_entry)
-        GenServer.cast(fsm_data.pid, {:apply, request})
+        GenServer.call(fsm_data.pid, {:apply, request})
       end
 
       defoverridable handle_cast_read: 2, handle_call_read: 3, handle_write: 2
@@ -102,6 +103,6 @@ defmodule DistributedGenserver do
   end
 
   def start_link(module, init_args, cluster, options \\ []) when is_atom(module) and is_list(cluster) and is_list(options) do
-    GenServer.start_link(module, %{cluster: cluster, init_args: init_args}, options)
+    GenServer.start_link(module, %{cluster: cluster, init_args: init_args, timeout: options |> Keyword.get(:timeout, 4_500)}, options)
   end
 end
