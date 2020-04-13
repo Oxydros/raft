@@ -15,7 +15,6 @@ defmodule DistributedKS do
   def put_and_get(key, value), do: DistributedGenserver.call_write(__MODULE__, {:put_and_get, key, value})
   def state(), do: DistributedGenserver.call_read(__MODULE__, :get_full_state)
 
-
   #########################################
   #          Server Implementation        #
   #########################################
@@ -33,7 +32,7 @@ defmodule DistributedKS do
     DistributedGenserver.start_link(__MODULE__, nil, cluster(), [name: __MODULE__, debug: [:trace]])
   end
 
-  def initialize(_) do
+  def init(_) do
     {:ok, %{}}
   end
 
