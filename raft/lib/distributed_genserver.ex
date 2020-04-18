@@ -24,7 +24,7 @@ defmodule DistributedGenserver do
       end
 
       def handle_continue({:setup_raft, cluster}, state) do
-        {:ok, raft_pid} = Raft.Client.start_link(%{cluster: cluster, module: __MODULE__, raft_cluster_id: "distributedKS"})
+        {:ok, raft_pid} = Raft.Client.start_link(%{cluster: cluster, module: __MODULE__, raft_cluster_id: "distributedKS", pid: self()})
         {:noreply, state |> Map.put(:raft_pid, raft_pid)}
       end
 
@@ -63,7 +63,7 @@ defmodule DistributedGenserver do
       # Called by the Raft Protocol when the log entry is commited
       def apply_log_entry(log_entry, fsm_data) do
         request = :erlang.binary_to_term(log_entry)
-        GenServer.call(fsm_data.pid, {:apply, request})
+        GenServer.call(fsm_data.pid, {:apply, request}, 15_000)
       end
 
       def init(%{mod: mod, cluster: cluster, timeout: timeout, init_args: init_args}) do

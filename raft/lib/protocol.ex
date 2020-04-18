@@ -35,18 +35,7 @@ defmodule Raft.Protocol do
     case get_leader!() do
       nil -> :no_leader
       leader_node ->
-        case :gen_statem.call({__MODULE__, leader_node}, {:raft, req}) do
-          ret_ref when is_reference(ret_ref) ->
-            receive do
-              {^ret_ref, reply} ->
-                reply
-            after
-              timeout ->
-                {:error, :timeout}
-            end
-          reply ->
-            reply
-        end
+        :gen_statem.call({__MODULE__, leader_node}, {:raft, req}, timeout)
     end
   end
 
@@ -90,7 +79,7 @@ defmodule Raft.Protocol do
   end
 
   def init(%{cluster: _cluster, module: module, raft_cluster_id: raft_id} = args) do
-    Logger.debug("[Raft - Protocol] Starting FSM for #{inspect module}-#{inspect raft_id} --- #{Node.self()}")
+    Logger.debug("[Raft - Protocol] Starting FSM for #{inspect module}-#{inspect raft_id} --- #{Node.self()} --- #{inspect args}")
 
     File.mkdir_p(@db_dir)
     path = '#{@db_dir}/#{raft_id}.db'
@@ -441,7 +430,7 @@ defmodule Raft.Protocol do
       |> Map.put(:validBeats, 0)
 
     # Append no-op entry
-    fsm_data = add_log(new_entry(:no_op), nil, nil, fsm_data)
+    fsm_data = add_log(new_entry(:no_op), nil, fsm_data)
     {:keep_state, fsm_data, [get_heartbeat_timer()]}
   end
 
@@ -547,10 +536,9 @@ defmodule Raft.Protocol do
 
   def leader({:call, from}, {:raft, req}, fsm_data) do
     Logger.warn("[leader] Received req for raft #{inspect req} from #{inspect from}")
-    ret_ref = make_ref()
     req = new_entry(req)
-    fsm_data = add_log(req, from, ret_ref, fsm_data)
-    {:keep_state, fsm_data, [{:reply, from, ret_ref}]}
+    fsm_data = add_log(req, from, fsm_data)
+    {:keep_state, fsm_data}
   end
 
   def leader({:timeout, :election}, :election_timeout, _fsm_data) do
@@ -584,7 +572,7 @@ defmodule Raft.Protocol do
     end
   end
 
-  defp add_log(new_log, node_from, ret_ref, fsm_data) do
+  defp add_log(new_log, call_from, fsm_data) do
     # Format log entries to incorporate currentTerm
     new_log = %{data: new_log, term: fsm_data[:currentTerm]}
     new_logs = fsm_data[:logs] ++ [new_log]
@@ -592,13 +580,13 @@ defmodule Raft.Protocol do
 
     # Reply upon commit of this index by the cluster
     # to the node asking to process this data (node_from)
-    new_replyMap = case node_from do
+    new_replyMap = case call_from do
       nil ->
         fsm_data.replyMap
       _ ->
         Logger.debug("[ADD LOGS] Updating #{inspect fsm_data[:replyMap]} for #{last_index}")
-        fsm_data[:replyMap] |> Map.update(last_index, [{node_from, ret_ref}], fn
-          current_list -> current_list ++ [{node_from, ret_ref}]
+        fsm_data[:replyMap] |> Map.update(last_index, [call_from], fn
+          current_list -> current_list ++ [call_from]
         end)
     end
 
@@ -673,8 +661,8 @@ defmodule Raft.Protocol do
       Logger.debug("NOTIFYING #{inspect last_applied}: #{inspect to_notify}")
 
       spawn fn ->
-        to_notify |> Enum.each(fn {from, ret_ref} ->
-          send(from, {ret_ref, reply})
+        to_notify |> Enum.each(fn from ->
+          :gen_statem.reply(from, reply)
         end)
       end
 
