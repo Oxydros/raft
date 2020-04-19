@@ -7,6 +7,7 @@ defmodule Raft.Protocol do
 
   @db_dir "#{Application.app_dir(:raft)}/.raft"
   @state_key "RAFT_STATE"
+  @client_timeout_ms 10_000
 
   #########################################
   #               FSM Client              #
@@ -15,8 +16,12 @@ defmodule Raft.Protocol do
   @doc """
   Open a new client session to be used for all futher requests
   """
-  def registerClient(timeout \\ 10_000) do
+  def register_client(timeout \\ 10_000) do
     send_raft_request(:register_client, timeout)
+  end
+
+  def keep_alive(client_id, timeout \\ 10_000) do
+    send_raft_request({:keep_alive, client_id}, timeout)
   end
 
   @doc """
@@ -257,6 +262,11 @@ defmodule Raft.Protocol do
   # Ignore resp append
   def follower(:cast, {:resp_append, {term, success?}, _from}, _fsm_data) do
     Logger.warn("[follower] Got resp append with term #{term} - success #{success?}. Ignoring it !")
+    :keep_state_and_data
+  end
+
+  # Ignore heartbeat. We were Leader but now we are follower
+  def follower({:timeout, :heartbeat}, :heartbeat, _fsm_data) do
     :keep_state_and_data
   end
 
@@ -574,7 +584,7 @@ defmodule Raft.Protocol do
 
   defp add_log(new_log, call_from, fsm_data) do
     # Format log entries to incorporate currentTerm
-    new_log = %{data: new_log, term: fsm_data[:currentTerm]}
+    new_log = %{data: new_log, term: fsm_data[:currentTerm], time: :os.system_time(:millisecond)}
     new_logs = fsm_data[:logs] ++ [new_log]
     last_index = new_logs |> Enum.count
 
@@ -650,8 +660,11 @@ defmodule Raft.Protocol do
 
       Logger.debug("Applying log entry #{last_applied} #{inspect(log_entry, [limit: :infinity, pretty: true])} to the FSM #{inspect fsm_data.module}")
 
+      ## Discard clients that have timeout
+      fsm_data = discard_timeout_clients(log_entry.time, fsm_data)
+
       {:raft, req} = log_entry.data
-      {reply, fsm_data} = handle_raft_entry(req, last_applied, fsm_data)
+      {reply, fsm_data} = handle_raft_entry(req, last_applied, log_entry.time, fsm_data)
 
       Logger.debug("#{last_applied} APPLIED")
 
@@ -737,6 +750,13 @@ defmodule Raft.Protocol do
       |> Map.put(:votes, 0)
   end
 
+  defp discard_timeout_clients(leader_ms, fsm_data) do
+    clients = fsm_data.clients |> Enum.filter(fn {_client_id, client_data} ->
+      leader_ms - client_data.last_active_time < @client_timeout_ms
+    end)|> Enum.into(%{})
+    fsm_data |> Map.put(:clients, clients)
+  end
+
   defp get_election_timer() do
     {{:timeout, :election}, Enum.random(2_000..3_000), :election_timeout}
   end
@@ -768,21 +788,35 @@ defmodule Raft.Protocol do
     {:raft, req}
   end
 
-  defp handle_raft_entry(:no_op, _log_idx, fsm_data), do: {:ok, fsm_data}
+  defp handle_raft_entry(:no_op, _log_idx, _leader_ms, fsm_data), do: {:ok, fsm_data}
 
   # Allocate a session for a new client
-  defp handle_raft_entry(:register_client, log_idx, fsm_data) do
+  defp handle_raft_entry(:register_client, log_idx, leader_ms, fsm_data) do
 
     case fsm_data.clients[log_idx] do
       nil ->
         Logger.debug("[Raft Protocol] New client registered with id #{inspect log_idx}")
-        {{:ok, log_idx}, fsm_data |> put_in([:clients, log_idx], %{})}
+        {{:ok, log_idx}, fsm_data |> put_in([:clients, log_idx], %{replies: %{}, last_active_time: leader_ms})}
       _ ->
         raise "Unable to register client for #{inspect log_idx}. Already exists !"
     end
   end
 
-  defp handle_raft_entry({client_id, sequence_num, {:write_log, new_log}}, _log_idx, fsm_data) do
+  # Keep alive request
+  defp handle_raft_entry({:keep_alive, client_id}, _log_idx, leader_ms, fsm_data) do
+
+    case fsm_data.clients[client_id] do
+      nil ->
+        {:session_expired, fsm_data}
+      client_data ->
+        new_client_data = client_data
+          |> Map.put(:last_active_time, leader_ms)
+        fsm_data = fsm_data |> put_in([:clients, client_id], new_client_data)
+        {:ok, fsm_data}
+    end
+  end
+
+  defp handle_raft_entry({client_id, sequence_num, {:write_log, new_log}}, _log_idx, leader_ms, fsm_data) do
     Logger.warn("[Raft Protocol] Received write log with #{inspect(new_log)} from client #{inspect client_id}")
 
     case fsm_data.clients[client_id] do
@@ -790,25 +824,38 @@ defmodule Raft.Protocol do
       nil ->
         {:session_expired, fsm_data}
       client_data ->
-        case client_data[sequence_num] do
+        case client_data.replies[sequence_num] do
           # Need to process
           nil ->
             #Apply the log to the FSM by calling the function :apply_log_entry/2 from the FSM Elixir Module
             reply = apply(fsm_data.module, :apply_log_entry, [new_log, fsm_data])
 
             # Save answer for this specific sequence
-            # TODO disgard all previous sequences
-            fsm_data = fsm_data |> put_in([:clients, client_id, sequence_num], reply)
+            # Discard all previous sequences
+            new_replies = fsm_data.clients[client_id].replies |> Enum.into(%{}, fn {seq, entry} ->
+              {seq, %{entry | discarded: true}}
+            end)
+              |> Map.put(sequence_num, %{reply: reply, discarded: false})
+
+            new_client_data = client_data
+              |> Map.put(:replies, new_replies)
+              |> Map.put(:last_active_time, leader_ms)
+
+            fsm_data = fsm_data |> put_in([:clients, client_id], new_client_data)
 
             {reply, fsm_data}
           # No need to process, answer directly
-          reply ->
+          %{discarded: false, reply: reply} ->
             {reply, fsm_data}
+
+          # Answer is discarded, return session expired
+          %{discarded: true} ->
+            {:session_expired, fsm_data}
         end
     end
   end
 
-  defp handle_raft_entry(req, _log_idx, _fsm_data) do
+  defp handle_raft_entry(req, _log_idx, _leader_ms, _fsm_data) do
     raise "Unknown raft entry #{inspect req}"
   end
 end

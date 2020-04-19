@@ -5,7 +5,6 @@ defmodule Raft.Client do
   Register to the FSM using Raft.Protocol.registerClient/0 and keep the id in state
   """
   use GenServer
-
   require Logger
 
   @doc """
@@ -46,13 +45,20 @@ defmodule Raft.Client do
   def try_register(0, _), do: :no_leader
   def try_register(retry, wait_ms) do
     Logger.debug("TRYING REGISTER")
-    case Raft.Protocol.registerClient() do
+    case Raft.Protocol.register_client() do
       :no_leader ->
         :timer.sleep(wait_ms)
         try_register(retry - 1, wait_ms)
       {:ok, client_id} ->
         client_id
     end
+  end
+
+  def generate_uid() do
+    to_hash = (Integer.to_string(:os.system_time(:millisecond)) <> :crypto.strong_rand_bytes(10))
+    hash = :crypto.hash(:sha, to_hash) |> Base.encode64()
+    {{y, m, d}, _} = :calendar.universal_time
+    "#{y}-#{m}-#{d}-#{hash}"
   end
 
   def handle_call({:write_log, new_log, timeout}, _from, state) do
@@ -70,7 +76,7 @@ defmodule Raft.Client do
       :error ->
         {:reply, :error, state}
       client_id ->
-        seq_num = Enum.random(1..100_000)
+        seq_num = generate_uid()
         {:reply, Raft.Protocol.write_log(client_id, seq_num, new_log, timeout), %{state | client_id: client_id}}
     end
   end
